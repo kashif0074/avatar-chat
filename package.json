@@ -10,8 +10,9 @@
   "files": ["dist", "src", "README.md", "LICENSE"],
   "scripts": {
     "build": "node scripts/build.js",
-    "server": "node --env-file=.env server.js",
-    "start": "node scripts/build.js && node --env-file=.env server.js"
+    "server": "node server.js",
+    "start": "node scripts/build.js && node server.js",
+    "dev": "node server.js"
   },
   "keywords": ["avatar", "chatbot", "rag", "talking-head", "tts"],
   "license": "MIT"
