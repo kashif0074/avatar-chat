@@ -1,0 +1,18 @@
+{
+  "name": "avatar-chat",
+  "version": "0.1.0",
+  "description": "Free talking-avatar chat core. Bring your own RAG/LLM, idle and talking videos. No GPU.",
+  "type": "module",
+  "main": "dist/avatar-chat.esm.js",
+  "module": "dist/avatar-chat.esm.js",
+  "unpkg": "dist/avatar-chat.js",
+  "jsdelivr": "dist/avatar-chat.js",
+  "files": ["dist", "src", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "server": "node --env-file=.env server.js",
+    "start": "node scripts/build.js && node --env-file=.env server.js"
+  },
+  "keywords": ["avatar", "chatbot", "rag", "talking-head", "tts"],
+  "license": "MIT"
+}
