@@ -16,6 +16,7 @@ export class AvatarSpeaker {
     onState = () => {},
     onAnswer = () => {},
     onVolume = () => {},
+    onSpeechProgress = () => {},
     lang = "en-US",
     voiceName,
     speakUrl = "/speak",
@@ -25,6 +26,7 @@ export class AvatarSpeaker {
     this.onAnswer = onAnswer;
     this.onState = onState;
     this.onVolume = onVolume;
+    this.onSpeechProgress = onSpeechProgress;
     this.idleVideo = idleVideo;
     this.talkingVideo = talkingVideo;
     this.idleImage = idleImage;
@@ -55,8 +57,10 @@ export class AvatarSpeaker {
     try {
       const answer = await this.onAsk(question);
       if (generation !== this.#generation) return answer;
-      this.onAnswer(answer);
       await this.say(answer, generation);
+      if (generation === this.#generation) {
+        this.onAnswer(answer);
+      }
       return answer;
     } catch (error) {
       if (generation === this.#generation) this.#state("idle");
@@ -76,7 +80,7 @@ export class AvatarSpeaker {
       const audioBuffer = await this.#fetchSpeech(spoken);
       if (generation !== this.#generation) return;
       this.#state("speaking");
-      await this.#playSynced(audioBuffer, generation);
+      await this.#playSynced(audioBuffer, generation, spoken);
     } catch {
       if (generation !== this.#generation) return;
       await this.#sayBrowser(spoken, generation);
@@ -134,7 +138,7 @@ export class AvatarSpeaker {
     return buffer;
   }
 
-  async #playSynced(arrayBuffer, generation) {
+  async #playSynced(arrayBuffer, generation, spokenText = "") {
     const ctx = this.#context();
     if (ctx.state === "suspended") await ctx.resume();
     const audio = await ctx.decodeAudioData(arrayBuffer.slice(0));
@@ -166,6 +170,10 @@ export class AvatarSpeaker {
       this.#play(video);
     }
 
+    const words = String(spokenText || "").trim().split(/\s+/).filter(Boolean);
+    const wordTimings = calculateWordTimings(spokenText, audio.duration);
+    let nextWordIdx = -1;
+
     const started = ctx.currentTime;
     let settled = false;
     const finish = () => {
@@ -179,6 +187,15 @@ export class AvatarSpeaker {
         } catch {
           /* ignore */
         }
+      }
+      if (words.length > 0) {
+        this.onSpeechProgress({
+          text: spokenText,
+          words,
+          currentWordIndex: words.length - 1,
+          currentWord: words[words.length - 1],
+          isComplete: true,
+        });
       }
       if (generation === this.#generation) this.#state("idle");
     };
@@ -202,6 +219,20 @@ export class AvatarSpeaker {
       if (t >= audio.duration) {
         finish();
         return;
+      }
+
+      // Live word-by-word subtitle and speech progression
+      if (wordTimings.length > 0) {
+        while (nextWordIdx + 1 < wordTimings.length && wordTimings[nextWordIdx + 1].time <= t) {
+          nextWordIdx += 1;
+          this.onSpeechProgress({
+            text: spokenText,
+            words,
+            currentWordIndex: nextWordIdx,
+            currentWord: words[nextWordIdx],
+            isComplete: false,
+          });
+        }
       }
 
       const openness = envelope.at(t);
@@ -268,6 +299,12 @@ export class AvatarSpeaker {
       this.#state("idle");
       return Promise.resolve();
     }
+    const words = String(spoken || "").trim().split(/\s+/).filter(Boolean);
+    const estimatedDuration = Math.max(1.5, words.length * 0.38);
+    const wordTimings = calculateWordTimings(spoken, estimatedDuration);
+    let nextWordIdx = -1;
+    let speechStartTime = 0;
+
     const parts = spoken.match(/[^.!?]+[.!?]*/g)?.map((part) => part.trim()).filter(Boolean) || [spoken];
     const voice = this.#pickVoice();
     const video = this.talkingVideo;
@@ -286,11 +323,21 @@ export class AvatarSpeaker {
             /* ignore */
           }
         }
+        if (words.length > 0) {
+          this.onSpeechProgress({
+            text: spoken,
+            words,
+            currentWordIndex: words.length - 1,
+            currentWord: words[words.length - 1],
+            isComplete: true,
+          });
+        }
         this.#state("idle");
         resolve();
       };
 
       const startSpeechAnimation = () => {
+        speechStartTime = performance.now();
         let t = 0;
         if (video) {
           video.playbackRate = 1.0;
@@ -298,6 +345,20 @@ export class AvatarSpeaker {
         }
         const tick = () => {
           if (settled || generation !== this.#generation) return;
+          const elapsed = (performance.now() - speechStartTime) / 1000;
+          if (wordTimings.length > 0) {
+            while (nextWordIdx + 1 < wordTimings.length && wordTimings[nextWordIdx + 1].time <= elapsed) {
+              nextWordIdx += 1;
+              this.onSpeechProgress({
+                text: spoken,
+                words,
+                currentWordIndex: nextWordIdx,
+                currentWord: words[nextWordIdx],
+                isComplete: false,
+              });
+            }
+          }
+
           t += 0.12;
           const energy = (Math.sin(t * 3.8) + 1) * 0.35 + (Math.sin(t * 1.6) + 1) * 0.15;
           this.onVolume(energy);
@@ -343,6 +404,7 @@ export class AvatarSpeaker {
     cancelAnimationFrame(this.#raf);
     cancelAnimationFrame(this.#browserRaf);
     this.onVolume(0);
+    this.onSpeechProgress({ isCancelled: true });
     if (this.#source) {
       try {
         this.#source.stop();
@@ -412,11 +474,11 @@ export class AvatarSpeaker {
         } else {
           talking.classList.add("active");
           talking.pause();
-          try {
-            talking.currentTime = 0;
-          } catch {
-            /* ignore */
-          }
+        }
+        try {
+          talking.currentTime = 0;
+        } catch {
+          /* ignore */
         }
       }
     }
@@ -431,6 +493,30 @@ export class AvatarSpeaker {
 
     this.onState(state);
   }
+}
+
+function calculateWordTimings(text, duration) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+  if (duration <= 0) return words.map((w, i) => ({ word: w, time: 0, index: i }));
+
+  const weights = words.map((w) => {
+    let weight = Math.max(2.2, w.replace(/[^\w]/g, "").length);
+    if (/[,;:]$/.test(w)) weight += 3.2;
+    if (/[.!?]$/.test(w)) weight += 5.5;
+    return weight;
+  });
+
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  const leadIn = Math.min(0.18, duration * 0.05);
+  const available = Math.max(0.1, duration - leadIn - 0.2);
+
+  let cumulative = 0;
+  return words.map((word, i) => {
+    const time = leadIn + (cumulative / totalWeight) * available;
+    cumulative += weights[i];
+    return { word, time: Math.round(time * 1000) / 1000, index: i };
+  });
 }
 
 function buildEnvelope(buffer) {

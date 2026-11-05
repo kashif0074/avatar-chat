@@ -23,6 +23,7 @@ class AvatarSpeaker {
     onState = () => {},
     onAnswer = () => {},
     onVolume = () => {},
+    onSpeechProgress = () => {},
     lang = "en-US",
     voiceName,
     speakUrl = "/speak",
@@ -32,6 +33,7 @@ class AvatarSpeaker {
     this.onAnswer = onAnswer;
     this.onState = onState;
     this.onVolume = onVolume;
+    this.onSpeechProgress = onSpeechProgress;
     this.idleVideo = idleVideo;
     this.talkingVideo = talkingVideo;
     this.idleImage = idleImage;
@@ -62,8 +64,10 @@ class AvatarSpeaker {
     try {
       const answer = await this.onAsk(question);
       if (generation !== this.#generation) return answer;
-      this.onAnswer(answer);
       await this.say(answer, generation);
+      if (generation === this.#generation) {
+        this.onAnswer(answer);
+      }
       return answer;
     } catch (error) {
       if (generation === this.#generation) this.#state("idle");
@@ -83,7 +87,7 @@ class AvatarSpeaker {
       const audioBuffer = await this.#fetchSpeech(spoken);
       if (generation !== this.#generation) return;
       this.#state("speaking");
-      await this.#playSynced(audioBuffer, generation);
+      await this.#playSynced(audioBuffer, generation, spoken);
     } catch {
       if (generation !== this.#generation) return;
       await this.#sayBrowser(spoken, generation);
@@ -141,7 +145,7 @@ class AvatarSpeaker {
     return buffer;
   }
 
-  async #playSynced(arrayBuffer, generation) {
+  async #playSynced(arrayBuffer, generation, spokenText = "") {
     const ctx = this.#context();
     if (ctx.state === "suspended") await ctx.resume();
     const audio = await ctx.decodeAudioData(arrayBuffer.slice(0));
@@ -173,6 +177,10 @@ class AvatarSpeaker {
       this.#play(video);
     }
 
+    const words = String(spokenText || "").trim().split(/\s+/).filter(Boolean);
+    const wordTimings = calculateWordTimings(spokenText, audio.duration);
+    let nextWordIdx = -1;
+
     const started = ctx.currentTime;
     let settled = false;
     const finish = () => {
@@ -186,6 +194,15 @@ class AvatarSpeaker {
         } catch {
           /* ignore */
         }
+      }
+      if (words.length > 0) {
+        this.onSpeechProgress({
+          text: spokenText,
+          words,
+          currentWordIndex: words.length - 1,
+          currentWord: words[words.length - 1],
+          isComplete: true,
+        });
       }
       if (generation === this.#generation) this.#state("idle");
     };
@@ -209,6 +226,20 @@ class AvatarSpeaker {
       if (t >= audio.duration) {
         finish();
         return;
+      }
+
+      // Live word-by-word subtitle and speech progression
+      if (wordTimings.length > 0) {
+        while (nextWordIdx + 1 < wordTimings.length && wordTimings[nextWordIdx + 1].time <= t) {
+          nextWordIdx += 1;
+          this.onSpeechProgress({
+            text: spokenText,
+            words,
+            currentWordIndex: nextWordIdx,
+            currentWord: words[nextWordIdx],
+            isComplete: false,
+          });
+        }
       }
 
       const openness = envelope.at(t);
@@ -275,6 +306,12 @@ class AvatarSpeaker {
       this.#state("idle");
       return Promise.resolve();
     }
+    const words = String(spoken || "").trim().split(/\s+/).filter(Boolean);
+    const estimatedDuration = Math.max(1.5, words.length * 0.38);
+    const wordTimings = calculateWordTimings(spoken, estimatedDuration);
+    let nextWordIdx = -1;
+    let speechStartTime = 0;
+
     const parts = spoken.match(/[^.!?]+[.!?]*/g)?.map((part) => part.trim()).filter(Boolean) || [spoken];
     const voice = this.#pickVoice();
     const video = this.talkingVideo;
@@ -293,11 +330,21 @@ class AvatarSpeaker {
             /* ignore */
           }
         }
+        if (words.length > 0) {
+          this.onSpeechProgress({
+            text: spoken,
+            words,
+            currentWordIndex: words.length - 1,
+            currentWord: words[words.length - 1],
+            isComplete: true,
+          });
+        }
         this.#state("idle");
         resolve();
       };
 
       const startSpeechAnimation = () => {
+        speechStartTime = performance.now();
         let t = 0;
         if (video) {
           video.playbackRate = 1.0;
@@ -305,6 +352,20 @@ class AvatarSpeaker {
         }
         const tick = () => {
           if (settled || generation !== this.#generation) return;
+          const elapsed = (performance.now() - speechStartTime) / 1000;
+          if (wordTimings.length > 0) {
+            while (nextWordIdx + 1 < wordTimings.length && wordTimings[nextWordIdx + 1].time <= elapsed) {
+              nextWordIdx += 1;
+              this.onSpeechProgress({
+                text: spoken,
+                words,
+                currentWordIndex: nextWordIdx,
+                currentWord: words[nextWordIdx],
+                isComplete: false,
+              });
+            }
+          }
+
           t += 0.12;
           const energy = (Math.sin(t * 3.8) + 1) * 0.35 + (Math.sin(t * 1.6) + 1) * 0.15;
           this.onVolume(energy);
@@ -350,6 +411,7 @@ class AvatarSpeaker {
     cancelAnimationFrame(this.#raf);
     cancelAnimationFrame(this.#browserRaf);
     this.onVolume(0);
+    this.onSpeechProgress({ isCancelled: true });
     if (this.#source) {
       try {
         this.#source.stop();
@@ -419,11 +481,11 @@ class AvatarSpeaker {
         } else {
           talking.classList.add("active");
           talking.pause();
-          try {
-            talking.currentTime = 0;
-          } catch {
-            /* ignore */
-          }
+        }
+        try {
+          talking.currentTime = 0;
+        } catch {
+          /* ignore */
         }
       }
     }
@@ -438,6 +500,30 @@ class AvatarSpeaker {
 
     this.onState(state);
   }
+}
+
+function calculateWordTimings(text, duration) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+  if (duration <= 0) return words.map((w, i) => ({ word: w, time: 0, index: i }));
+
+  const weights = words.map((w) => {
+    let weight = Math.max(2.2, w.replace(/[^\w]/g, "").length);
+    if (/[,;:]$/.test(w)) weight += 3.2;
+    if (/[.!?]$/.test(w)) weight += 5.5;
+    return weight;
+  });
+
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  const leadIn = Math.min(0.18, duration * 0.05);
+  const available = Math.max(0.1, duration - leadIn - 0.2);
+
+  let cumulative = 0;
+  return words.map((word, i) => {
+    const time = leadIn + (cumulative / totalWeight) * available;
+    cumulative += weights[i];
+    return { word, time: Math.round(time * 1000) / 1000, index: i };
+  });
 }
 
 function buildEnvelope(buffer) {
@@ -537,6 +623,7 @@ const STYLES = `
   right: 24px;
   width: 380px;
   max-width: calc(100vw - 32px);
+  height: min(520px, calc(100vh - 100px));
   max-height: calc(100vh - 98px);
   margin: 0;
   z-index: 99999;
@@ -569,9 +656,9 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 14px 18px;
-  background: rgba(255, 255, 255, 0.95);
+  gap: 10px;
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid #f1f5f9;
   z-index: 10;
@@ -581,14 +668,14 @@ const STYLES = `
   position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
   flex: 1;
 }
 
 .avatar-thumb {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
   background: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
   display: flex;
@@ -596,8 +683,8 @@ const STYLES = `
   justify-content: center;
   color: #ffffff;
   font-weight: 700;
-  font-size: 15px;
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
+  font-size: 13.5px;
+  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.22);
   flex-shrink: 0;
   position: relative;
 }
@@ -637,10 +724,11 @@ const STYLES = `
 
 .title {
   margin: 0;
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 700;
   letter-spacing: -0.015em;
   color: #0f172a;
+  line-height: 1.2;
 }
 
 .badge {
@@ -657,10 +745,10 @@ const STYLES = `
 .meta {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   margin-top: 1px;
   color: #64748b;
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .dot {
@@ -726,10 +814,10 @@ const STYLES = `
 }
 
 .icon-btn {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border-radius: 9px;
   background: #f8fafc;
   color: #475569;
   cursor: pointer;
@@ -951,10 +1039,10 @@ const STYLES = `
 .stage {
   position: relative;
   width: 100%;
-  flex: 0 0 auto;
-  height: clamp(260px, 42vh, 340px);
-  max-height: 360px;
-  aspect-ratio: 1 / 1;
+  flex: 0 0 230px;
+  height: 230px;
+  min-height: 220px;
+  max-height: 240px;
   background: #edeae3;
   overflow: hidden;
   border-bottom: 1px solid #f1f5f9;
@@ -967,7 +1055,7 @@ const STYLES = `
   z-index: 1;
   pointer-events: none;
   overflow: hidden;
-  background: #edeae3 url('/assets/avatar_idle.png') center top / cover no-repeat;
+  background: #edeae3 url('/assets/avatar_idle.png') center 35% / cover no-repeat;
   filter: blur(16px);
   opacity: 0.95;
   transform: scale(1.06);
@@ -1002,11 +1090,59 @@ const STYLES = `
   width: 100%;
   height: 100%;
   object-fit: cover;
-  object-position: center top;
+  object-position: center 35%;
   opacity: 0;
   z-index: 3;
   transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   pointer-events: none;
+}
+
+/* Live Subtitles overlay at bottom of stage */
+.stage-subtitles {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.subtitle-pill {
+  max-width: 95%;
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #f8fafc;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  line-height: 1.4;
+  font-weight: 500;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.1);
+  text-align: center;
+  word-break: break-word;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.subtitle-pill.active {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.subtitle-pill .sub-prev {
+  color: #94a3b8;
+  margin-right: 4px;
+}
+
+.subtitle-pill .sub-cur {
+  color: #38bdf8;
+  font-weight: 700;
+  text-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
 }
 
 .stage-media.active {
@@ -1080,13 +1216,13 @@ const STYLES = `
 /* Chat Log */
 .log {
   flex: 1 1 auto;
-  min-height: 60px;
+  min-height: 100px;
   max-height: none;
   overflow-y: auto;
-  padding: 10px 14px;
+  padding: 8px 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   background: #f8fafc;
   scroll-behavior: smooth;
 }
@@ -1209,6 +1345,27 @@ const STYLES = `
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
 }
 
+.row.bot.speaking-live .bubble {
+  border-color: #cbd5e1;
+  background: #ffffff;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.08);
+}
+
+.live-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 13px;
+  background: #6366f1;
+  margin-left: 2px;
+  vertical-align: -1px;
+  animation: cursor-blink 0.8s infinite;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
 .row.error .bubble {
   background: #fef2f2;
   border-color: #fecaca;
@@ -1268,7 +1425,7 @@ const STYLES = `
 
 /* Composer / Input */
 .composer-wrap {
-  padding: 12px 14px;
+  padding: 8px 12px;
   background: #ffffff;
   border-top: 1px solid #f1f5f9;
 }
@@ -1280,7 +1437,7 @@ const STYLES = `
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 16px;
-  padding: 4px 6px 4px 14px;
+  padding: 3px 6px 3px 12px;
   transition: all 0.2s ease;
 }
 
@@ -1295,9 +1452,9 @@ const STYLES = `
   min-width: 0;
   border: 0;
   background: transparent;
-  padding: 8px 0;
+  padding: 6px 0;
   font: inherit;
-  font-size: 14px;
+  font-size: 13.5px;
   color: #0f172a;
 }
 
@@ -1310,8 +1467,8 @@ const STYLES = `
 }
 
 .mic-btn {
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   border: 0;
   border-radius: 50%;
   background: transparent;
@@ -1342,10 +1499,10 @@ const STYLES = `
 }
 
 .send-btn {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border: 0;
-  border-radius: 12px;
+  border-radius: 10px;
   background: #0f172a;
   color: #ffffff;
   cursor: pointer;
@@ -1372,9 +1529,9 @@ const STYLES = `
 }
 
 .composer-hint {
-  margin-top: 6px;
+  margin-top: 4px;
   text-align: center;
-  font-size: 11px;
+  font-size: 10.5px;
   color: #94a3b8;
 }
 
@@ -1427,21 +1584,22 @@ const STYLES = `
   }
 
   .stage {
-    flex: 0 0 auto;
+    flex: 0 0 240px;
     width: 100%;
-    height: min(44vh, 320px);
+    height: 240px;
+    max-height: 240px;
     aspect-ratio: auto;
     border-radius: 0;
   }
 
   .stage-media {
-    object-position: center top;
+    object-position: center 35%;
   }
 
   .log {
     flex: 1 1 auto;
     max-height: none;
-    min-height: 80px;
+    min-height: 120px;
     padding: 12px;
   }
 
@@ -1475,7 +1633,9 @@ const STYLES = `
     right: auto;
   }
   .stage {
-    max-height: 340px;
+    flex: 0 0 230px;
+    height: 230px;
+    max-height: 240px;
   }
 }
 `;
@@ -1504,8 +1664,8 @@ class AvatarChat {
 
     this.options = {
       title: "Ava",
-      subtitle: "Voice Assistant",
-      badge: "AI",
+      subtitle: "Voice assistant",
+      badge: options.badge || "",
       endpoint: "/ask",
       placeholder: "Ask Ava anything…",
       idleSrc: options.idleSrc || options.idleVideo || "",
@@ -1546,7 +1706,7 @@ class AvatarChat {
             <div class="who">
               <div class="title-row">
                 <h2 class="title">${escapeHtml(this.options.title)}</h2>
-                <span class="badge">${escapeHtml(this.options.badge)}</span>
+                ${this.options.badge ? `<span class="badge">${escapeHtml(this.options.badge)}</span>` : ""}
               </div>
               <div class="meta">
                 <span class="dot" data-state="idle"></span>
@@ -1561,7 +1721,6 @@ class AvatarChat {
             <button class="icon-btn stop-btn" type="button" title="Stop speech" aria-label="Stop speech">${ICONS.stop}</button>
             <button class="icon-btn mute-btn" type="button" title="Mute voice" aria-pressed="false" aria-label="Mute voice">${ICONS.mute}</button>
             <button class="icon-btn clear-btn" type="button" title="Clear chat" aria-label="Clear chat">${ICONS.clear}</button>
-            ${this.options.floating ? `<button class="icon-btn pos-btn" type="button" title="Switch side (Left / Right)" aria-label="Switch side">${ICONS.dock}</button>` : ""}
             ${this.options.floating ? `<button class="icon-btn close-btn" type="button" title="Close chat" aria-label="Close chat">${ICONS.close}</button>` : ""}
           </div>
         </div>
@@ -1575,6 +1734,12 @@ class AvatarChat {
           ${hasTalkVid ? `<video class="stage-media talk-video ${talkVidActive}" src="${escapeAttr(this.options.talkingSrc)}" loop muted playsinline preload="auto"></video>` : ""}
           <canvas class="stage-media lips-canvas"></canvas>
           <div class="fallback ${fallbackActive}"><div class="face"><span class="mouth"></span></div></div>
+          <div class="stage-subtitles" aria-live="polite">
+            <div class="subtitle-pill" hidden>
+              <span class="sub-prev"></span>
+              <span class="sub-cur"></span>
+            </div>
+          </div>
         </div>
 
         <!-- Log -->
@@ -1627,6 +1792,8 @@ class AvatarChat {
       status: this.root.querySelector(".status-text"),
       dot: this.root.querySelector(".dot"),
       log: this.root.querySelector(".log"),
+      subtitles: this.root.querySelector(".stage-subtitles"),
+      subPill: this.root.querySelector(".subtitle-pill"),
       form: this.root.querySelector(".composer"),
       input: this.root.querySelector(".field"),
       send: this.root.querySelector(".send-btn"),
@@ -1644,6 +1811,8 @@ class AvatarChat {
     this.busy = false;
     this.hasVideo = hasTalkVid;
     this.hasIdleImageLoaded = false;
+    this.activeLiveRow = null;
+    this.hasStreamedLiveAnswer = false;
 
     this.#initMediaElements();
 
@@ -1656,7 +1825,15 @@ class AvatarChat {
       voiceName: this.options.voiceName,
       speakUrl: this.options.speakUrl,
       onAsk: (question) => this.#ask(question),
-      onAnswer: (answer) => this.#addMessage("bot", answer),
+      onSpeechProgress: (progress) => this.#handleSpeechProgress(progress),
+      onAnswer: (answer) => {
+        if (this.hasStreamedLiveAnswer) {
+          this.#finalizeLiveMessage(answer);
+        } else {
+          this.#addMessage("bot", answer);
+        }
+        this.#hideSubtitles();
+      },
       onState: (state) => this.#renderState(state),
     });
 
@@ -1760,10 +1937,14 @@ class AvatarChat {
 
     this.els.stop.addEventListener("click", () => {
       this.avatar.stop();
+      this.#finalizeLiveMessage();
+      this.#hideSubtitles();
     });
 
     this.els.clear.addEventListener("click", () => {
       this.avatar.stop();
+      this.#finalizeLiveMessage();
+      this.#hideSubtitles();
       this.els.log.innerHTML = `
         <div class="empty-box">
           <p class="empty-title">Conversation cleared</p>
@@ -1857,6 +2038,9 @@ class AvatarChat {
     if (!question || this.busy) return;
 
     this.els.input.value = "";
+    this.hasStreamedLiveAnswer = false;
+    this.#finalizeLiveMessage();
+    this.#hideSubtitles();
     this.#addMessage("user", question);
     this.busy = true;
     this.els.send.disabled = true;
@@ -1869,6 +2053,8 @@ class AvatarChat {
     } catch (error) {
       console.error("Avatar error:", error);
       this.avatar.stop();
+      this.#finalizeLiveMessage();
+      this.#hideSubtitles();
       this.#addMessage("error", "Sorry, I could not get an answer. Please try again.");
     } finally {
       thinkingEl?.remove();
@@ -1876,6 +2062,110 @@ class AvatarChat {
       this.els.send.disabled = false;
       this.els.input.disabled = false;
       this.els.input.focus();
+    }
+  }
+
+  #handleSpeechProgress({ text, words, currentWordIndex, currentWord, isComplete, isCancelled }) {
+    if (isCancelled) {
+      this.#finalizeLiveMessage();
+      this.#hideSubtitles();
+      return;
+    }
+
+    this.hasStreamedLiveAnswer = true;
+
+    // Clear thinking bubble as soon as speech starts
+    this.els.log.querySelector(".thinking-row")?.remove();
+
+    if (!this.activeLiveRow) {
+      this.els.log.querySelector(".empty-box")?.remove();
+      const row = document.createElement("div");
+      row.className = "row bot speaking-live";
+      row.innerHTML = `
+        <div class="bot-avatar" aria-hidden="true">A</div>
+        <div class="bubble-wrap">
+          <div class="bubble"><span class="live-text"></span><span class="live-cursor"></span></div>
+          <div class="bubble-footer" style="display: none;">
+            <span class="bubble-time"></span>
+            <button class="copy-btn" type="button" title="Copy text">${ICONS.copy} Copy</button>
+          </div>
+        </div>
+      `;
+      this.els.log.append(row);
+      this.activeLiveRow = row;
+    }
+
+    const liveTextEl = this.activeLiveRow.querySelector(".live-text");
+    if (liveTextEl && words) {
+      const revealedWords = words.slice(0, currentWordIndex + 1).join(" ");
+      liveTextEl.textContent = revealedWords;
+    }
+    this.els.log.scrollTop = this.els.log.scrollHeight;
+
+    // Real-time live subtitle pill on stage
+    if (this.els.subPill && words) {
+      this.els.subPill.hidden = false;
+      this.els.subPill.classList.add("active");
+      const subPrev = this.els.subPill.querySelector(".sub-prev");
+      const subCur = this.els.subPill.querySelector(".sub-cur");
+
+      // Show recent window of up to 4 words before current word
+      const startIdx = Math.max(0, currentWordIndex - 4);
+      const prevWords = words.slice(startIdx, currentWordIndex).join(" ");
+      if (subPrev) subPrev.textContent = prevWords ? prevWords + " " : "";
+      if (subCur) subCur.textContent = currentWord || "";
+    }
+
+    if (isComplete) {
+      this.#finalizeLiveMessage(text);
+      this.#hideSubtitles();
+    }
+  }
+
+  #finalizeLiveMessage(fullText) {
+    if (!this.activeLiveRow) return;
+    const row = this.activeLiveRow;
+    this.activeLiveRow = null;
+
+    row.classList.remove("speaking-live");
+    row.querySelector(".live-cursor")?.remove();
+
+    const liveTextEl = row.querySelector(".live-text");
+    if (fullText && liveTextEl) {
+      liveTextEl.textContent = fullText;
+    }
+
+    const footer = row.querySelector(".bubble-footer");
+    if (footer) {
+      footer.style.display = "flex";
+      const timeEl = footer.querySelector(".bubble-time");
+      if (timeEl) {
+        timeEl.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+      const copyBtn = footer.querySelector(".copy-btn");
+      const textToCopy = fullText || liveTextEl?.textContent || "";
+      if (copyBtn) {
+        copyBtn.addEventListener("click", () => {
+          navigator.clipboard?.writeText(textToCopy).then(() => {
+            copyBtn.textContent = "Copied!";
+            setTimeout(() => {
+              copyBtn.innerHTML = `${ICONS.copy} Copy`;
+            }, 1800);
+          });
+        });
+      }
+    }
+    this.els.log.scrollTop = this.els.log.scrollHeight;
+  }
+
+  #hideSubtitles() {
+    if (this.els.subPill) {
+      this.els.subPill.classList.remove("active");
+      setTimeout(() => {
+        if (!this.avatar || this.avatar.state !== "speaking") {
+          this.els.subPill.hidden = true;
+        }
+      }, 300);
     }
   }
 
@@ -1910,6 +2200,11 @@ class AvatarChat {
   }
 
   #addMessage(role, text) {
+    if (role === "bot") {
+      this.hasStreamedLiveAnswer = true;
+    }
+    this.#finalizeLiveMessage();
+    this.#hideSubtitles();
     this.els.log.querySelector(".empty-box")?.remove();
     this.els.log.querySelector(".thinking-row")?.remove();
 
